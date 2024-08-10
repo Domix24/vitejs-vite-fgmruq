@@ -1,0 +1,111 @@
+name: Push release to remote
+run-name: Push release to remote
+
+on:
+  release:
+    types:
+      released
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        type: string
+        required: false
+
+env:
+  remote-repository: domix24/lantana-with-tauri
+
+jobs:
+  get-release:
+    name: Get release
+    runs-on: ubuntu-latest
+    outputs:
+      release-tag: ${{ steps.tag-from-release.outputs.tag || (steps.tag-from-input.outcome == 'success' && fromJson(steps.tag-from-input.outputs.result).tagName || fromJson(steps.latest-release.outputs.result).tagName) }}
+    steps:
+      - id: checkout
+        name: Checkout repository
+        uses: actions/checkout@v4
+      - id: tag-from-release
+        name: Get tag from release
+        if: github.event_name == 'release'
+        run: |
+          echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+      - id: tag-from-input
+        name: Get tag from input
+        if: github.event_name == 'workflow_dispatch' && inputs.release-tag
+        uses: actions/github-script@v7
+        with:
+          script: |
+            return {tagName: await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: '${{ inputs.release-tag }}'
+            }).then(({data}) => data.tag_name).catch(() => undefined)}
+      - id: latest-release
+        name: Get latest release
+        if: github.event_name == 'workflow_dispatch' && (!inputs.release-tag || !fromJson(steps.tag-from-input.outputs.result).tagName)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            return {tagName: await github.rest.repos.getLatestRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            }).then(({data}) => data.tag_name).catch(() => undefined)}
+
+  push-remote:
+    name: Push remote
+    runs-on: ubuntu-latest
+    needs: get-release
+    steps:
+      - id: first-step
+        name: First step
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.remote-repository }}
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: first
+      - id: second-step
+        name: Second step
+        uses: actions/checkout@v4
+        with:
+          path: second
+          ref: ${{ needs.get-release.outputs.release-tag }}
+      - id: branch
+        name: Generate branch suffix
+        run: |
+          suffix=$(date -u -Iminutes | sed 's/-//g;s/://g;s/+0*//')
+          echo "name=tempbranch-$suffix" >> "$GITHUB_OUTPUT"
+      - id: git-config
+        name: Create git config
+        shell: bash
+        working-directory: first
+        run: |
+          git config user.email domix24@users.noreply.github.com
+          git config user.name domix24
+          git config commit.gpgsign true
+          git config user.signingkey ${{ secrets.COMMIT_SIGNING_KEY }}
+      - id: import-gpg
+        name: Import GPG private key
+        shell: bash
+        run: |
+          echo -n "${{ secrets.GPG_PRIVATE_KEY }}" | base64 --decode | gpg --import
+      - id: merge-repositories
+        name: Merge repositories
+        shell: bash
+        working-directory: first
+        run: |
+          git branch ${{ steps.branch.outputs.name }}
+          git checkout ${{ steps.branch.outputs.name }}
+          rm -rf ../second/.git ../second/.github
+          mv ../second .
+          cd second
+          cp -r .[!.]* * .. || cp -r * ..
+          cd ..
+          rm -rf second
+      - id: push-remote
+        name: Push to remote
+        shell: bash
+        working-directory: first
+        run: |
+          git add .
+          git commit -m "imported ${{ needs.get-release.outputs.release-tag }} from ${{ github.repository }}"
+          git push origin ${{ steps.branch.outputs.name }}
